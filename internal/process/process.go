@@ -124,15 +124,18 @@ func (p *Process) handleMessages() {
 			log.Printf("[P%d] Inventario corrupto recibido de M%dP%d, ignorado.", p.ProcessID, msg.MachineID, msg.ProcessID)
 
 		case protocol.MsgVeto:
-			p.st.UpdateVeto(msg.VetoName, msg.Counter)
+			p.st.Observe(msg.LamportClock)
+			p.st.UpdateVeto(msg.VetoName, msg.Counter, msg.LamportClock)
 			p.writeVetoLog()
 
 		case protocol.MsgPardon:
-			p.st.Pardon(msg.VetoName)
+			p.st.Observe(msg.LamportClock)
+			p.st.PardonRemote(msg.VetoName, msg.LamportClock)
 			p.writeVetoLog()
 
 		case protocol.MsgSyncVetos:
-			p.st.SetVetos(msg.Vetos)
+			p.st.Observe(msg.LamportClock)
+			p.st.SetVetos(msg.Vetos, msg.LamportClock)
 			p.writeVetoLog()
 
 		case protocol.MsgRecoverReply:
@@ -182,15 +185,14 @@ func (p *Process) execInstruction(line string) string {
 			return ""
 		}
 		persona := strings.Join(parts[1:], " ")
-		p.mu.Lock()
-		counter := p.st.Veto(persona)
-		p.mu.Unlock()
+		counter, clock := p.st.Veto(persona)
 		p.net.Broadcast(protocol.Message{
-			Type:      protocol.MsgVeto,
-			MachineID: p.MachineID,
-			ProcessID: p.ProcessID,
-			VetoName:  persona,
-			Counter:   counter,
+			Type:         protocol.MsgVeto,
+			MachineID:    p.MachineID,
+			ProcessID:    p.ProcessID,
+			VetoName:     persona,
+			Counter:      counter,
+			LamportClock: clock,
 		})
 		p.writeVetoLog()
 		return ""
@@ -205,22 +207,22 @@ func (p *Process) execInstruction(line string) string {
 		producto := parts[len(parts)-2]
 		persona := strings.Join(parts[1:len(parts)-2], " ")
 
-		p.mu.Lock()
 		result := p.st.Buy(persona, producto, cantidad)
-		p.mu.Unlock()
 
 		if result == "VALIDO" {
 			p.net.BroadcastInventory(p.st.GetInventory())
 			p.writeInventorySnapshot()
 		}
-		// Decrementar vetos cada instrucción
+		// Decrementar vetos cada instrucción; cada perdón automático resultante
+		// se propaga con su propio reloj de Lamport.
 		pardoned := p.st.DecrementVetos()
-		for _, pr := range pardoned {
+		for _, pe := range pardoned {
 			p.net.Broadcast(protocol.Message{
-				Type:      protocol.MsgPardon,
-				MachineID: p.MachineID,
-				ProcessID: p.ProcessID,
-				VetoName:  pr,
+				Type:         protocol.MsgPardon,
+				MachineID:    p.MachineID,
+				ProcessID:    p.ProcessID,
+				VetoName:     pe.Persona,
+				LamportClock: pe.Clock,
 			})
 		}
 		p.writeVetoLog()
@@ -231,14 +233,13 @@ func (p *Process) execInstruction(line string) string {
 			return ""
 		}
 		persona := strings.Join(parts[1:], " ")
-		p.mu.Lock()
-		p.st.Pardon(persona)
-		p.mu.Unlock()
+		clock := p.st.Pardon(persona)
 		p.net.Broadcast(protocol.Message{
-			Type:      protocol.MsgPardon,
-			MachineID: p.MachineID,
-			ProcessID: p.ProcessID,
-			VetoName:  persona,
+			Type:         protocol.MsgPardon,
+			MachineID:    p.MachineID,
+			ProcessID:    p.ProcessID,
+			VetoName:     persona,
+			LamportClock: clock,
 		})
 		p.writeVetoLog()
 		return ""

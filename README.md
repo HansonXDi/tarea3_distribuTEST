@@ -193,6 +193,7 @@ VETADO sofia lamb 5
 | Inventarios corruptos en recuperación | Votación por mayoría: se acepta el inventario con ≥ 2/3 réplicas iguales |
 | Condiciones de carrera en vetos | `sync.RWMutex` en `Store`; actualizaciones propagadas atómicamente |
 | Inventarios corruptos (modo malicioso) | Los mensajes de tipo `MALICIOUS_INV` son detectados y descartados |
+| Mensajes de red desordenados (un VETO viejo podría "resucitar" un PERDONAR más reciente) | **Reloj de Lamport** (`LamportClock`): cada proceso mantiene un contador lógico que avanza con cada evento local y se actualiza al recibir mensajes (`clock = max(local, remoto) + 1`). Cada evento de VETAR/PERDONAR sobre una persona se guarda en una cola ordenada por ese clock; ningún evento se descarta, todos se aplican, y el orden de aplicación sigue siempre la causalidad real aunque lleguen desordenados por la red |
 | Eliminación selectiva de un proceso | Cada expendedora corre como **proceso real e independiente del SO** (un binario por proceso), no como goroutine compartida; así `MATAR <ID>` solo afecta a ese proceso |
 
 > **Nota de diseño:** `script.sh` lanza un binario `./expendedora <MAQUINA> PROC <ID> <N>` por cada proceso lógico. Esto permite que `MATAR`/`KILLALL`/`RESTAURAR` operen sobre procesos reales del sistema operativo sin afectar a los demás. El comando `ESTADO` lee el inventario y vetos directamente desde `logs/snapshot_M<M>P<P>.json` y `logs/vetos_M<M>P<P>.log` (escritos por el proceso en ejecución), evitando crear una instancia nueva que choque con el puerto TCP ya ocupado.
