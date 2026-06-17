@@ -30,7 +30,9 @@ pid_file() {
     echo "$PIDS_DIR/m${1}p${2}.pid"
 }
 
-# start_processes: lanza N procesos de la máquina indicada en background.
+# start_processes: lanza N procesos como N binarios independientes (un proceso
+# real del SO por cada expendedora), permitiendo matar/restaurar cada uno por
+# separado sin afectar a los demás.
 # Entrada: MAQUINA, N. Salida: ninguna.
 start_processes() {
     local MAQUINA=$1
@@ -44,8 +46,9 @@ start_processes() {
             echo "[script] Proceso M${MAQUINA}P${ID} ya está corriendo (PID=$(cat "$PFILE"))."
             continue
         fi
-        "$BINARY" "$MAQUINA" "$N" &
+        "$BINARY" "$MAQUINA" PROC "$ID" "$N" &
         echo $! > "$PFILE"
+        echo "$N" > "${PFILE}.n"
         echo "[script] Iniciado M${MAQUINA}P${ID} (PID=$!)."
     done
 }
@@ -58,8 +61,16 @@ restore_process() {
     [ -f "$BINARY" ] || build_binary
     local PFILE
     PFILE=$(pid_file "$MAQUINA" "$ID")
-    "$BINARY" "$MAQUINA" RESTAURAR "$ID" &
+
+    # Recuperar N total guardado al iniciar; si no existe, asumir 2 por defecto.
+    local N=2
+    if [ -f "${PFILE}.n" ]; then
+        N=$(cat "${PFILE}.n")
+    fi
+
+    "$BINARY" "$MAQUINA" RESTAURAR "$ID" "$N" &
     echo $! > "$PFILE"
+    echo "$N" > "${PFILE}.n"
     echo "[script] Proceso M${MAQUINA}P${ID} restaurado (PID=$!)."
 }
 
@@ -78,7 +89,7 @@ kill_process() {
         else
             echo "[script] PID $PID no encontrado (quizás ya terminó)."
         fi
-        rm -f "$PFILE"
+        rm -f "$PFILE" "${PFILE}.n"
     else
         echo "[script] No hay PID registrado para M${MAQUINA}P${ID}."
     fi
@@ -93,7 +104,7 @@ killall_machine() {
         local PID
         PID=$(cat "$PFILE")
         kill -9 "$PID" 2>/dev/null && echo "[script] Terminado PID=$PID" || true
-        rm -f "$PFILE"
+        rm -f "$PFILE" "${PFILE}.n"
     done
     echo "[script] Todos los procesos de la máquina $MAQUINA terminados."
 }

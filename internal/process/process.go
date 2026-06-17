@@ -18,11 +18,12 @@ import (
 
 // Process representa una expendedora: tiene estado local y se comunica con sus pares.
 type Process struct {
-	MachineID   int
-	ProcessID   int
+	MachineID    int
+	ProcessID    int
 	instructFile string
 	st           *store.Store
 	net          *netsync.Network
+	peers        []netsync.PeerConfig
 	malicious    bool
 	mu           sync.Mutex
 	logPath      string
@@ -39,6 +40,7 @@ func New(machineID, processID int, instructFile string, peers []netsync.PeerConf
 		ProcessID:    processID,
 		instructFile: instructFile,
 		st:           store.New(),
+		peers:        peers,
 		logPath:      fmt.Sprintf("logs/inventario_M%dP%d.log", machineID, processID),
 		vetoLogPath:  fmt.Sprintf("logs/vetos_M%dP%d.log", machineID, processID),
 	}
@@ -68,6 +70,7 @@ func (p *Process) loadRandomInventory() error {
 		return err
 	}
 	p.st.SetInventory(items)
+	p.writeInventorySnapshot()
 	log.Printf("[P%d] Inventario cargado desde %s", p.ProcessID, chosen)
 	return nil
 }
@@ -78,6 +81,10 @@ func (p *Process) Start() {
 	if err := p.net.Listen(); err != nil {
 		log.Fatalf("[P%d] Error escuchando: %v", p.ProcessID, err)
 	}
+
+	// Goroutine que procesa mensajes entrantes (arranca antes de esperar para no perder HELLOs)
+	go p.handleMessages()
+
 	p.net.ConnectPeers()
 
 	// Esperar hasta 2 segundos a que los peers conecten
@@ -88,10 +95,7 @@ func (p *Process) Start() {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	log.Printf("[P%d] Conectado a %d peers. Iniciando instrucciones.", p.ProcessID, p.net.ConnectedCount())
-
-	// Goroutine que procesa mensajes entrantes
-	go p.handleMessages()
+	log.Printf("[P%d] Conectado a %d/%d peers. Iniciando instrucciones.", p.ProcessID, p.net.ConnectedCount(), len(p.getPeerAddrs()))
 
 	// Ejecutar instrucciones del archivo asignado
 	p.runInstructions()
@@ -100,8 +104,11 @@ func (p *Process) Start() {
 // getPeerAddrs retorna las direcciones de todos los peers configurados.
 // Entrada: ninguna. Salida: slice de strings con las IPs:puerto.
 func (p *Process) getPeerAddrs() []string {
-	// Esta función es un helper; la lógica real está en Network.
-	return nil
+	addrs := make([]string, len(p.peers))
+	for i, peer := range p.peers {
+		addrs[i] = peer.Addr
+	}
+	return addrs
 }
 
 // handleMessages procesa de forma continua los mensajes del canal de red.
@@ -111,6 +118,7 @@ func (p *Process) handleMessages() {
 		switch msg.Type {
 		case protocol.MsgInventory:
 			p.st.SetInventory(msg.Inventory)
+			p.writeInventorySnapshot()
 
 		case protocol.MsgMalicious:
 			log.Printf("[P%d] Inventario corrupto recibido de M%dP%d, ignorado.", p.ProcessID, msg.MachineID, msg.ProcessID)
@@ -203,6 +211,7 @@ func (p *Process) execInstruction(line string) string {
 
 		if result == "VALIDO" {
 			p.net.BroadcastInventory(p.st.GetInventory())
+			p.writeInventorySnapshot()
 		}
 		// Decrementar vetos cada instrucción
 		pardoned := p.st.DecrementVetos()
@@ -285,6 +294,7 @@ func (p *Process) Recover() error {
 	}
 
 	p.st.SetInventory(chosen)
+	p.writeInventorySnapshot()
 	log.Printf("[P%d] Recuperación exitosa con %d/%d votos", p.ProcessID, count, len(received))
 	return nil
 }
@@ -346,6 +356,20 @@ func (p *Process) writeVetoLog() {
 	for _, v := range vetos {
 		fmt.Fprintf(f, "VETADO %s %d\n", v.Persona, v.Counter)
 	}
+}
+
+// writeInventorySnapshot escribe el inventario actual en un archivo JSON separado
+// (logs/snapshot_M<M>P<P>.json), permitiendo que el comando ESTADO lo lea sin
+// necesitar crear una instancia nueva del proceso que choque por puerto ocupado.
+// Entrada: ninguna. Salida: ninguna.
+func (p *Process) writeInventorySnapshot() {
+	os.MkdirAll("logs", 0755)
+	path := fmt.Sprintf("logs/snapshot_M%dP%d.json", p.MachineID, p.ProcessID)
+	data, err := json.MarshalIndent(p.st.GetInventory(), "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0644)
 }
 
 // Status imprime el inventario y vetos actuales por stdout.
