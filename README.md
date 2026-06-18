@@ -2,10 +2,10 @@
 
 ## Integrantes
 
-| Nombre | Apellido | Rol |
+| Nombres | Apellidos | Rol |
 |--------|----------|-----|
-| Emilio | Valdebenito Pinto | 202273040-4 |
-| Erick | Ávila Ayala | 202273103-6 |
+| Emilio Alonso | Valdebenito Pinto | 202273040-4 |
+| Erick Jakin | Ávila Ayala | 202273103-6 |
 | Hans | Villouta Laing | 202273052-8 |
 
 ---
