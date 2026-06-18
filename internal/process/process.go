@@ -2,7 +2,6 @@ package process
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
@@ -10,145 +9,193 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"tarea3/internal/httpapi"
 	"tarea3/internal/protocol"
 	"tarea3/internal/store"
-	netsync "tarea3/internal/sync"
 	"time"
 )
 
-// Process representa una expendedora: tiene estado local y se comunica con sus pares.
+// ReplicaConfig identifica a una réplica paralela: mismo ProcessID (mismo
+// rol/expendedora), pero corriendo en otra máquina virtual.
+type ReplicaConfig struct {
+	MachineID int
+	BaseURL   string // ej: http://10.10.28.36:8101
+}
+
+// Process representa una expendedora: tiene su propio Store (inventario y
+// vetos persistidos en disco) y se comunica con sus réplicas paralelas
+// (mismo ProcessID en las otras máquinas) vía REST.
 type Process struct {
 	MachineID    int
 	ProcessID    int
 	instructFile string
-	st           *store.Store
-	net          *netsync.Network
-	peers        []netsync.PeerConfig
-	malicious    bool
-	mu           sync.Mutex
-	logPath      string
-	vetoLogPath  string
-	instrCounter int // instrucciones ejecutadas (para decrement de vetos)
+
+	st       *store.Store
+	server   *httpapi.Server
+	replicas []ReplicaConfig
+
+	mu       sync.Mutex
+	infected bool // modo "infectado": reporta datos falsos en el state-report final
+
+	logPath     string
+	vetoLogPath string
 }
 
-// New crea un Process y carga el inventario inicial aleatorio.
-// Entrada: machineID, processID, archivo de instrucciones, peers, puerto de escucha.
-// Salida: *Process listo para iniciar.
-func New(machineID, processID int, instructFile string, peers []netsync.PeerConfig, listenPort int) *Process {
+// New crea un Process con su Store y servidor HTTP propios, pero todavía sin
+// inventario cargado (eso ocurre en Run()).
+// Entrada: machineID, processID, archivo de instrucciones, réplicas paralelas, puerto.
+// Salida: *Process listo para Run().
+func New(machineID, processID int, instructFile string, replicas []ReplicaConfig, port int) *Process {
+	invPath := fmt.Sprintf("logs/inventario_propio_M%dP%d.json", machineID, processID)
 	p := &Process{
 		MachineID:    machineID,
 		ProcessID:    processID,
 		instructFile: instructFile,
-		st:           store.New(),
-		peers:        peers,
+		st:           store.New(invPath),
+		server:       httpapi.NewServer(port),
+		replicas:     replicas,
 		logPath:      fmt.Sprintf("logs/inventario_M%dP%d.log", machineID, processID),
 		vetoLogPath:  fmt.Sprintf("logs/vetos_M%dP%d.log", machineID, processID),
-	}
-	p.net = netsync.NewNetwork(machineID, processID, listenPort, peers, &p.malicious)
-
-	// Carga un inventario aleatorio de la carpeta inventario/
-	if err := p.loadRandomInventory(); err != nil {
-		log.Fatalf("[P%d] No se pudo cargar inventario: %v", processID, err)
 	}
 	return p
 }
 
-// loadRandomInventory elige aleatoriamente un JSON de /inventario y lo carga en el store.
-// Entrada: ninguna. Salida: error si no hay archivos o no se puede parsear.
-func (p *Process) loadRandomInventory() error {
+// Run ejecuta el ciclo de vida completo y bloquea hasta terminar:
+//  1. Levanta el servidor REST propio.
+//  2. Revisa si existe el flag de infección en disco (creado por
+//     `script.sh INFECTAR` antes de levantar el proceso) y, si existe,
+//     activa el modo infectado desde el arranque.
+//  3. Elige un inventario plantilla al azar y lo copia como propio.
+//  4. Espera a que las réplicas paralelas estén disponibles.
+//  5. Envía su inventario inicial a las réplicas.
+//  6. Ejecuta sus instrucciones locales, generando logs.
+//  7. Vuelve a revisar el flag de infección (por si se activó vía señal
+//     SIGUSR1 durante la ejecución) antes de reportar su estado final.
+//  8. Reporta su estado final a las réplicas y espera los reportes de ellas.
+//  9. Determina el resultado por quórum 2/3 y lo deja escrito en disco.
+//
+// Entrada: ninguna. Salida: ninguna.
+func (p *Process) Run() {
+	p.server.Start()
+	go p.handleIncomingInventory()
+
+	if p.infectionFlagExists() {
+		p.SetInfected(true)
+	}
+
+	if err := p.pickAndLoadInventory(); err != nil {
+		log.Fatalf("[P%d] No se pudo cargar inventario: %v", p.ProcessID, err)
+	}
+
+	p.waitForReplicas()
+	p.broadcastInitialInventory()
+
+	log.Printf("[P%d] Ejecutando instrucciones...", p.ProcessID)
+	p.runInstructions()
+
+	// Revisión final del flag justo antes de reportar: cubre el caso de un
+	// ciclo de instrucciones muy rápido donde una señal SIGUSR1 enviada
+	// "a tiempo" podría procesarse después de este punto por scheduling.
+	if p.infectionFlagExists() {
+		p.SetInfected(true)
+	}
+
+	log.Printf("[P%d] Instrucciones finalizadas. Iniciando fase de comparación final.", p.ProcessID)
+	p.reportAndCompareFinalState()
+}
+
+// infectionFlagPath retorna la ruta del archivo flag que indica modo
+// infectado para este proceso específico.
+// Entrada: ninguna. Salida: path string.
+func (p *Process) infectionFlagPath() string {
+	return fmt.Sprintf(".infectado_M%dP%d", p.MachineID, p.ProcessID)
+}
+
+// infectionFlagExists revisa si existe el archivo flag de infección para
+// este proceso en el directorio de trabajo actual.
+// Entrada: ninguna. Salida: bool.
+func (p *Process) infectionFlagExists() bool {
+	_, err := os.Stat(p.infectionFlagPath())
+	return err == nil
+}
+
+// RefreshInfectedFromDisk vuelve a leer el archivo flag de infección y
+// actualiza el estado interno en consecuencia (presente = infectado,
+// ausente = no infectado). Se usa como reacción a SIGUSR1, manteniendo
+// disco y memoria sincronizados.
+// Entrada: ninguna. Salida: ninguna.
+func (p *Process) RefreshInfectedFromDisk() {
+	p.SetInfected(p.infectionFlagExists())
+}
+
+// pickAndLoadInventory elige aleatoriamente un archivo de /inventario y lo
+// copia como el inventario propio de este proceso (nunca usa el original
+// directamente).
+// Entrada: ninguna. Salida: error si no hay plantillas disponibles.
+func (p *Process) pickAndLoadInventory() error {
 	matches, err := filepath.Glob("inventario/*.json")
 	if err != nil || len(matches) == 0 {
-		return fmt.Errorf("no hay archivos de inventario")
+		return fmt.Errorf("no hay archivos de inventario en /inventario")
 	}
 	chosen := matches[rand.Intn(len(matches))]
-	data, err := os.ReadFile(chosen)
-	if err != nil {
-		return err
-	}
-	var items []protocol.Item
-	if err := json.Unmarshal(data, &items); err != nil {
-		return err
-	}
-	p.st.SetInventory(items)
-	p.writeInventorySnapshot()
-	log.Printf("[P%d] Inventario cargado desde %s", p.ProcessID, chosen)
-	return nil
+	log.Printf("[P%d] Plantilla de inventario elegida: %s", p.ProcessID, chosen)
+	return p.st.LoadFromTemplate(chosen)
 }
 
-// Start inicia la escucha de red, conecta peers, espera que estén listos y ejecuta instrucciones.
-// Entrada: ninguna. Salida: ninguna (bloquea hasta terminar instrucciones).
-func (p *Process) Start() {
-	if err := p.net.Listen(); err != nil {
-		log.Fatalf("[P%d] Error escuchando: %v", p.ProcessID, err)
+// waitForReplicas espera hasta 2 segundos a que cada réplica paralela
+// responda su endpoint /health, según lo especificado en el enunciado.
+// Entrada: ninguna. Salida: ninguna (continúa de todos modos tras el timeout).
+func (p *Process) waitForReplicas() {
+	var wg sync.WaitGroup
+	for _, r := range p.replicas {
+		wg.Add(1)
+		go func(r ReplicaConfig) {
+			defer wg.Done()
+			c := httpapi.NewClient(r.BaseURL)
+			ok := c.WaitHealthy(20, 100*time.Millisecond) // 20*100ms = 2s máx
+			if !ok {
+				log.Printf("[P%d] Advertencia: réplica M%dP%d (%s) no respondió a tiempo", p.ProcessID, r.MachineID, p.ProcessID, r.BaseURL)
+			}
+		}(r)
 	}
+	wg.Wait()
+	log.Printf("[P%d] Espera de réplicas finalizada.", p.ProcessID)
+}
 
-	// Goroutine que procesa mensajes entrantes (arranca antes de esperar para no perder HELLOs)
-	go p.handleMessages()
-
-	p.net.ConnectPeers()
-
-	// Esperar hasta 2 segundos a que los peers conecten
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if p.net.ConnectedCount() >= len(p.getPeerAddrs()) {
-			break
+// broadcastInitialInventory envía el inventario recién sorteado a todas las
+// réplicas paralelas vía POST /inventory.
+// Entrada: ninguna. Salida: ninguna (loguea errores de envío, no es fatal).
+func (p *Process) broadcastInitialInventory() {
+	payload := protocol.InventoryPayload{
+		MachineID: p.MachineID,
+		ProcessID: p.ProcessID,
+		Inventory: p.st.GetInventory(),
+	}
+	for _, r := range p.replicas {
+		c := httpapi.NewClient(r.BaseURL)
+		if err := c.SendInventory(payload); err != nil {
+			log.Printf("[P%d] Error enviando inventario inicial a M%d: %v", p.ProcessID, r.MachineID, err)
+		} else {
+			log.Printf("[P%d] Inventario inicial enviado a M%dP%d", p.ProcessID, r.MachineID, p.ProcessID)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
-	log.Printf("[P%d] Conectado a %d/%d peers. Iniciando instrucciones.", p.ProcessID, p.net.ConnectedCount(), len(p.getPeerAddrs()))
-
-	// Ejecutar instrucciones del archivo asignado
-	p.runInstructions()
 }
 
-// getPeerAddrs retorna las direcciones de todos los peers configurados.
-// Entrada: ninguna. Salida: slice de strings con las IPs:puerto.
-func (p *Process) getPeerAddrs() []string {
-	addrs := make([]string, len(p.peers))
-	for i, peer := range p.peers {
-		addrs[i] = peer.Addr
-	}
-	return addrs
-}
-
-// handleMessages procesa de forma continua los mensajes del canal de red.
+// handleIncomingInventory procesa en segundo plano los inventarios iniciales
+// que las réplicas paralelas envían a este proceso. Según el enunciado, cada
+// proceso paralelo guarda el inventario que recibe; aquí simplemente se
+// registra en el log para trazabilidad (el inventario que efectivamente se
+// usa para ejecutar instrucciones es siempre el propio, sorteado localmente).
 // Entrada: ninguna. Salida: ninguna (loop infinito en goroutine).
-func (p *Process) handleMessages() {
-	for msg := range p.net.RecvCh {
-		switch msg.Type {
-		case protocol.MsgInventory:
-			p.st.SetInventory(msg.Inventory)
-			p.writeInventorySnapshot()
-
-		case protocol.MsgMalicious:
-			log.Printf("[P%d] Inventario corrupto recibido de M%dP%d, ignorado.", p.ProcessID, msg.MachineID, msg.ProcessID)
-
-		case protocol.MsgVeto:
-			p.st.Observe(msg.LamportClock)
-			p.st.UpdateVeto(msg.VetoName, msg.Counter, msg.LamportClock)
-			p.writeVetoLog()
-
-		case protocol.MsgPardon:
-			p.st.Observe(msg.LamportClock)
-			p.st.PardonRemote(msg.VetoName, msg.LamportClock)
-			p.writeVetoLog()
-
-		case protocol.MsgSyncVetos:
-			p.st.Observe(msg.LamportClock)
-			p.st.SetVetos(msg.Vetos, msg.LamportClock)
-			p.writeVetoLog()
-
-		case protocol.MsgRecoverReply:
-			// Los replies de recovery se manejan en Recover()
-			p.net.RecvCh <- msg
-
-		case protocol.MsgHello:
-			log.Printf("[P%d] HELLO de M%dP%d", p.ProcessID, msg.MachineID, msg.ProcessID)
-		}
+func (p *Process) handleIncomingInventory() {
+	for payload := range p.server.InventoryCh {
+		log.Printf("[P%d] Inventario inicial recibido de M%dP%d (registrado, no se usa para ejecución local)", p.ProcessID, payload.MachineID, payload.ProcessID)
 	}
 }
 
-// runInstructions lee y ejecuta cada línea del archivo de instrucciones asignado.
+// runInstructions lee y ejecuta cada línea del archivo de instrucciones
+// asignado a este proceso (según su ProcessID), generando una entrada de
+// log por cada una.
 // Entrada: ninguna. Salida: ninguna.
 func (p *Process) runInstructions() {
 	f, err := os.Open(p.instructFile)
@@ -166,12 +213,14 @@ func (p *Process) runInstructions() {
 		}
 		result := p.execInstruction(line)
 		p.appendLog(line, result)
-		p.instrCounter++
 	}
+	p.writeVetoLog()
 }
 
-// execInstruction parsea y ejecuta una instrucción de texto.
-// Entrada: línea de instrucción. Salida: resultado ("VALIDO", "DENEGADO", "NO VALIDO", o "").
+// execInstruction parsea y ejecuta una instrucción de texto (VETAR, COMPRAR
+// o PERDONAR) sobre el Store local de este proceso.
+// Entrada: línea de instrucción. Salida: resultado a loguear ("VALIDO",
+// "DENEGADO", "NO VALIDO", o "" si la instrucción no produce resultado).
 func (p *Process) execInstruction(line string) string {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
@@ -185,16 +234,7 @@ func (p *Process) execInstruction(line string) string {
 			return ""
 		}
 		persona := strings.Join(parts[1:], " ")
-		counter, clock := p.st.Veto(persona)
-		p.net.Broadcast(protocol.Message{
-			Type:         protocol.MsgVeto,
-			MachineID:    p.MachineID,
-			ProcessID:    p.ProcessID,
-			VetoName:     persona,
-			Counter:      counter,
-			LamportClock: clock,
-		})
-		p.writeVetoLog()
+		p.st.Veto(persona)
 		return ""
 
 	case "COMPRAR":
@@ -208,24 +248,7 @@ func (p *Process) execInstruction(line string) string {
 		persona := strings.Join(parts[1:len(parts)-2], " ")
 
 		result := p.st.Buy(persona, producto, cantidad)
-
-		if result == "VALIDO" {
-			p.net.BroadcastInventory(p.st.GetInventory())
-			p.writeInventorySnapshot()
-		}
-		// Decrementar vetos cada instrucción; cada perdón automático resultante
-		// se propaga con su propio reloj de Lamport.
-		pardoned := p.st.DecrementVetos()
-		for _, pe := range pardoned {
-			p.net.Broadcast(protocol.Message{
-				Type:         protocol.MsgPardon,
-				MachineID:    p.MachineID,
-				ProcessID:    p.ProcessID,
-				VetoName:     pe.Persona,
-				LamportClock: pe.Clock,
-			})
-		}
-		p.writeVetoLog()
+		p.st.DecrementVetos() // cada instrucción decrementa los counters de veto activos
 		return result
 
 	case "PERDONAR":
@@ -233,83 +256,88 @@ func (p *Process) execInstruction(line string) string {
 			return ""
 		}
 		persona := strings.Join(parts[1:], " ")
-		clock := p.st.Pardon(persona)
-		p.net.Broadcast(protocol.Message{
-			Type:         protocol.MsgPardon,
-			MachineID:    p.MachineID,
-			ProcessID:    p.ProcessID,
-			VetoName:     persona,
-			LamportClock: clock,
-		})
-		p.writeVetoLog()
+		p.st.Pardon(persona)
 		return ""
 	}
 	return ""
 }
 
-// Recover ejecuta el protocolo de recuperación: solicita inventarios a peers y elige por mayoría.
-// Entrada: ninguna. Salida: error si no se alcanza quórum de 2/3.
-func (p *Process) Recover() error {
-	log.Printf("[P%d] Iniciando recuperación...", p.ProcessID)
-
-	// Canal temporal para recolectar inventarios durante 3 segundos
-	invCh := make(chan []protocol.Item, 64)
-
-	// Interceptar mensajes de inventario por 3 segundos
-	go func() {
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			select {
-			case msg := <-p.net.RecvCh:
-				if msg.Type == protocol.MsgInventory {
-					invCh <- msg.Inventory
-				}
-			case <-time.After(100 * time.Millisecond):
-			}
-		}
-		close(invCh)
-	}()
-
-	// Pedir a todos los peers que envíen su inventario
-	p.net.Broadcast(protocol.Message{
-		Type:      protocol.MsgRecover,
+// reportAndCompareFinalState envía el estado final (inventario + vetos) de
+// este proceso a sus réplicas paralelas, espera sus reportes, y determina el
+// resultado final por quórum 2/3. Si no se alcanza el quórum, se considera
+// que el sistema fue "infectado" y se reporta el error correspondiente.
+// Entrada: ninguna. Salida: ninguna (persiste el resultado a logs/resultado_*).
+func (p *Process) reportAndCompareFinalState() {
+	realPayload := protocol.StatePayload{
 		MachineID: p.MachineID,
 		ProcessID: p.ProcessID,
-	})
-
-	// Recolectar respuestas
-	var received [][]protocol.Item
-	for inv := range invCh {
-		received = append(received, inv)
+		Inventory: p.st.GetInventory(),
+		Vetos:     p.st.GetVetos(),
+		Infected:  p.IsInfected(),
 	}
 
-	if len(received) == 0 {
-		return fmt.Errorf("[P%d] Recuperación fallida: sin respuestas", p.ProcessID)
+	// Si este proceso está infectado, TANTO lo que envía a las réplicas COMO
+	// lo que aporta a su propio cálculo de quórum es el estado falso: un
+	// proceso bizantino miente de forma consistente, no solo hacia afuera.
+	outgoing := realPayload
+	if p.IsInfected() {
+		outgoing = p.corruptedPayload(realPayload)
+		log.Printf("[P%d] MODO INFECTADO: enviando estado falso a las réplicas", p.ProcessID)
 	}
 
-	// Buscar el inventario con mayor cantidad de réplicas iguales
-	chosen, count := majorityInventory(received)
-	threshold := float64(len(received)) * 2.0 / 3.0
-	if float64(count) < threshold {
-		return fmt.Errorf("[P%d] Recuperación fallida: quórum insuficiente (%d/%d)", p.ProcessID, count, len(received))
+	for _, r := range p.replicas {
+		c := httpapi.NewClient(r.BaseURL)
+		if err := c.SendStateReport(outgoing); err != nil {
+			log.Printf("[P%d] Error enviando state-report a M%d: %v", p.ProcessID, r.MachineID, err)
+		}
 	}
 
-	p.st.SetInventory(chosen)
-	p.writeInventorySnapshot()
-	log.Printf("[P%d] Recuperación exitosa con %d/%d votos", p.ProcessID, count, len(received))
-	return nil
+	// Recolectar reportes de las réplicas durante una ventana de tiempo.
+	received := []protocol.StatePayload{outgoing}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && len(received) < len(p.replicas)+1 {
+		select {
+		case sp := <-p.server.StateCh:
+			received = append(received, sp)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	p.resolveQuorum(received)
 }
 
-// majorityInventory devuelve el inventario más repetido y su frecuencia.
-// Entrada: slice de inventarios. Salida: inventario ganador, frecuencia.
-func majorityInventory(inventories [][]protocol.Item) ([]protocol.Item, int) {
-	counts := make(map[string]int)
-	reps := make(map[string][]protocol.Item)
-	for _, inv := range inventories {
-		key := inventoryKey(inv)
-		counts[key]++
-		reps[key] = inv
+// corruptedPayload genera una versión falsa/corrupta del estado, simulando
+// un proceso bizantino en modo "infectado".
+// Entrada: el payload real. Salida: una copia con datos inventados.
+func (p *Process) corruptedPayload(real protocol.StatePayload) protocol.StatePayload {
+	fake := protocol.StatePayload{
+		MachineID: real.MachineID,
+		ProcessID: real.ProcessID,
+		Infected:  true,
 	}
+	for _, item := range real.Inventory {
+		fake.Inventory = append(fake.Inventory, protocol.Item{
+			Nombre:   item.Nombre,
+			Cantidad: item.Cantidad + 9999 + rand.Intn(500), // cantidad inventada
+		})
+	}
+	fake.Vetos = append(fake.Vetos, protocol.VetoEntry{Persona: "splicer_fantasma", Counter: 99})
+	return fake
+}
+
+// resolveQuorum determina si ≥2/3 de los reportes recibidos coinciden en su
+// inventario y vetos. Si se alcanza el quórum, ese es el resultado válido y
+// se persiste. Si no, se reporta el error de integridad estilo BioShock.
+// Entrada: slice de StatePayload recolectados (incluye el propio). Salida: ninguna.
+func (p *Process) resolveQuorum(received []protocol.StatePayload) {
+	counts := make(map[string]int)
+	reps := make(map[string]protocol.StatePayload)
+	for _, sp := range received {
+		key := stateKey(sp)
+		counts[key]++
+		reps[key] = sp
+	}
+
 	var bestKey string
 	best := 0
 	for k, c := range counts {
@@ -318,18 +346,73 @@ func majorityInventory(inventories [][]protocol.Item) ([]protocol.Item, int) {
 			bestKey = k
 		}
 	}
-	return reps[bestKey], best
+
+	threshold := float64(len(received)) * 2.0 / 3.0
+	resultPath := fmt.Sprintf("logs/resultado_M%dP%d.txt", p.MachineID, p.ProcessID)
+
+	if float64(best) >= threshold && best > 0 {
+		winner := reps[bestKey]
+		msg := fmt.Sprintf(
+			"QUORUM ALCANZADO (%d/%d). Resultado validado:\nInventario: %+v\nVetos: %+v\n",
+			best, len(received), winner.Inventory, winner.Vetos,
+		)
+		log.Printf("[P%d] %s", p.ProcessID, strings.ReplaceAll(msg, "\n", " "))
+		_ = os.WriteFile(resultPath, []byte(msg), 0644)
+	} else {
+		msg := fmt.Sprintf(
+			"ERROR DE INTEGRIDAD (%d/%d, se requiere >= 2/3): "+
+				"Todas las máquinas han sido infectadas, por favor revíseme.\n"+
+				"Reportes recibidos: %+v\n",
+			best, len(received), received,
+		)
+		log.Printf("[P%d] %s", p.ProcessID, strings.ReplaceAll(msg, "\n", " "))
+		_ = os.WriteFile(resultPath, []byte(msg), 0644)
+	}
 }
 
-// inventoryKey serializa un inventario a string para comparación.
-// Entrada: slice de Items. Salida: string clave.
-func inventoryKey(inv []protocol.Item) string {
-	data, _ := json.Marshal(inv)
-	return string(data)
+// stateKey serializa el inventario y vetos de un StatePayload a una clave
+// comparable, ignorando el campo Infected (que es metadato, no parte del
+// estado a comparar) y MachineID/ProcessID (distintas réplicas del MISMO
+// proceso lógico deben compararse solo por su contenido).
+// Entrada: StatePayload. Salida: string clave determinística.
+func stateKey(sp protocol.StatePayload) string {
+	var b strings.Builder
+	items := append([]protocol.Item{}, sp.Inventory...)
+	sortItems(items)
+	for _, it := range items {
+		fmt.Fprintf(&b, "%s=%d;", it.Nombre, it.Cantidad)
+	}
+	b.WriteString("|")
+	vetos := append([]protocol.VetoEntry{}, sp.Vetos...)
+	sortVetos(vetos)
+	for _, v := range vetos {
+		fmt.Fprintf(&b, "%s=%d;", v.Persona, v.Counter)
+	}
+	return b.String()
+}
+
+// sortItems ordena un slice de Items por nombre, in-place, para comparación determinística.
+// Entrada: slice de Items. Salida: ninguna (modifica in-place).
+func sortItems(items []protocol.Item) {
+	for i := 1; i < len(items); i++ {
+		for j := i; j > 0 && items[j-1].Nombre > items[j].Nombre; j-- {
+			items[j-1], items[j] = items[j], items[j-1]
+		}
+	}
+}
+
+// sortVetos ordena un slice de VetoEntry por persona, in-place, para comparación determinística.
+// Entrada: slice de VetoEntry. Salida: ninguna (modifica in-place).
+func sortVetos(vetos []protocol.VetoEntry) {
+	for i := 1; i < len(vetos); i++ {
+		for j := i; j > 0 && vetos[j-1].Persona > vetos[j].Persona; j-- {
+			vetos[j-1], vetos[j] = vetos[j], vetos[j-1]
+		}
+	}
 }
 
 // appendLog escribe una línea en el log de instrucciones del proceso.
-// Entrada: instrucción original, resultado. Salida: ninguna.
+// Entrada: instrucción original, resultado obtenido. Salida: ninguna.
 func (p *Process) appendLog(instruction, result string) {
 	os.MkdirAll("logs", 0755)
 	f, err := os.OpenFile(p.logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -344,7 +427,7 @@ func (p *Process) appendLog(instruction, result string) {
 	fmt.Fprintln(f, line)
 }
 
-// writeVetoLog reescribe el archivo de vetos con el estado actual.
+// writeVetoLog escribe el estado final de vetos en su archivo de log.
 // Entrada: ninguna. Salida: ninguna.
 func (p *Process) writeVetoLog() {
 	os.MkdirAll("logs", 0755)
@@ -359,18 +442,35 @@ func (p *Process) writeVetoLog() {
 	}
 }
 
-// writeInventorySnapshot escribe el inventario actual en un archivo JSON separado
-// (logs/snapshot_M<M>P<P>.json), permitiendo que el comando ESTADO lo lea sin
-// necesitar crear una instancia nueva del proceso que choque por puerto ocupado.
-// Entrada: ninguna. Salida: ninguna.
-func (p *Process) writeInventorySnapshot() {
-	os.MkdirAll("logs", 0755)
-	path := fmt.Sprintf("logs/snapshot_M%dP%d.json", p.MachineID, p.ProcessID)
-	data, err := json.MarshalIndent(p.st.GetInventory(), "", "  ")
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(path, data, 0644)
+// Recover en este modelo de arquitectura no reconstruye estado a partir de
+// mensajes en vivo: un proceso restaurado simplemente vuelve a ejecutar su
+// ciclo de vida completo desde cero (Run), lo cual incluye sortear un nuevo
+// inventario, distribuirlo, ejecutar sus instrucciones y comparar al final.
+// Esta función queda como alias explícito para mantener la semántica del
+// comando RESTAURAR del enunciado.
+// Entrada: ninguna. Salida: ninguna (bloquea igual que Run).
+func (p *Process) Recover() {
+	log.Printf("[P%d] RESTAURAR: reiniciando ciclo de vida completo.", p.ProcessID)
+	p.Run()
+}
+
+// SetInfected activa o desactiva el modo "infectado" de este proceso: al
+// activarse, el siguiente reporte de estado final que se envíe a las
+// réplicas paralelas contendrá datos falsos/inventados.
+// Entrada: bool. Salida: ninguna.
+func (p *Process) SetInfected(v bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.infected = v
+	log.Printf("[P%d] Modo infectado: %v", p.ProcessID, v)
+}
+
+// IsInfected informa si el proceso está actualmente en modo infectado.
+// Entrada: ninguna. Salida: bool.
+func (p *Process) IsInfected() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.infected
 }
 
 // Status imprime el inventario y vetos actuales por stdout.
@@ -387,21 +487,4 @@ func (p *Process) Status() {
 	for _, v := range vetos {
 		fmt.Printf("  %s (counter=%d)\n", v.Persona, v.Counter)
 	}
-}
-
-// SetMalicious activa o desactiva el modo malicioso del proceso.
-// Entrada: bool. Salida: ninguna.
-func (p *Process) SetMalicious(m bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.malicious = m
-	log.Printf("[P%d] Modo malicioso: %v", p.ProcessID, m)
-}
-
-// IsMalicious retorna si el proceso está en modo malicioso.
-// Entrada: ninguna. Salida: bool.
-func (p *Process) IsMalicious() bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.malicious
 }

@@ -1,55 +1,81 @@
 package store
 
 import (
-	"sort"
+	"encoding/json"
+	"fmt"
+	"os"
 	"sync"
 	"tarea3/internal/protocol"
 )
 
-// vetoEvent representa un único evento de veto o perdón sobre una persona,
-// con su reloj de Lamport asociado para poder ordenarlo causalmente respecto
-// a otros eventos sobre la misma persona, sin importar en qué orden llegaron
-// por la red.
-type vetoEvent struct {
-	clock   int64
-	isVeto  bool // true = VETAR (fija counter=5), false = PERDONAR (elimina)
-	counter int  // solo relevante si isVeto == true
-}
-
-// Store mantiene el estado local del proceso: inventario y lista de vetos.
-// Es thread-safe mediante un RWMutex.
-//
-// La lista de vetos NO se aplica mensaje por mensaje al vuelo: cada evento
-// (VETAR/PERDONAR, local o remoto) se guarda en una cola ordenada por reloj
-// de Lamport (eventLog) y el estado visible (vetos) se recalcula re-jugando
-// esa cola en orden. Así ningún evento se pierde aunque lleguen desordenados
-// por la red, y el resultado final es siempre el mismo sin importar el orden
-// de llegada.
+// Store representa la "base de datos" local de un proceso: su inventario y
+// su lista de vetos, persistidos como archivos JSON en disco (cada proceso
+// tiene su propio archivo, nunca comparte el original de /inventario).
+// Es thread-safe mediante un RWMutex, ya que se accede tanto desde la
+// ejecución de instrucciones como desde el servidor HTTP.
 type Store struct {
-	mu        sync.RWMutex
-	inventory []protocol.Item
-	vetos     map[string]int          // persona -> counter vigente (derivado de eventLog)
-	eventLog  map[string][]vetoEvent  // persona -> eventos ordenables por clock
-	clock     int64                   // reloj de Lamport local de este proceso
+	mu            sync.RWMutex
+	inventory     []protocol.Item
+	vetos         map[string]int // persona -> counter restante
+	inventoryPath string         // ruta del archivo JSON propio de este proceso
 }
 
-// New crea un Store vacío.
-// Entrada: ninguna. Salida: *Store inicializado.
-func New() *Store {
+// New crea un Store vacío asociado a un archivo de inventario propio.
+// Entrada: ruta donde se persistirá el inventario propio de este proceso.
+// Salida: *Store inicializado.
+func New(inventoryPath string) *Store {
 	return &Store{
-		vetos:    make(map[string]int),
-		eventLog: make(map[string][]vetoEvent),
+		vetos:         make(map[string]int),
+		inventoryPath: inventoryPath,
 	}
 }
 
-// SetInventory reemplaza el inventario completo de forma atómica.
-// Entrada: slice de Items. Salida: ninguna.
+// LoadFromTemplate copia el contenido de un archivo de inventario plantilla
+// (de la carpeta /inventario) hacia el archivo propio de este proceso, y lo
+// carga en memoria. Esto asegura que el proceso nunca modifica el archivo
+// original, solo su copia individual.
+// Entrada: ruta del archivo plantilla elegido aleatoriamente.
+// Salida: error si no se puede leer la plantilla o escribir la copia.
+func (s *Store) LoadFromTemplate(templatePath string) error {
+	data, err := os.ReadFile(templatePath)
+	if err != nil {
+		return fmt.Errorf("no se pudo leer plantilla %s: %w", templatePath, err)
+	}
+	var items []protocol.Item
+	if err := json.Unmarshal(data, &items); err != nil {
+		return fmt.Errorf("plantilla %s inválida: %w", templatePath, err)
+	}
+
+	s.mu.Lock()
+	s.inventory = items
+	s.mu.Unlock()
+
+	return s.persist()
+}
+
+// persist escribe el inventario actual en el archivo propio del proceso en
+// disco (la "copia" individual mencionada en el enunciado).
+// Entrada: ninguna (usa s.inventoryPath). Salida: error si falla la escritura.
+func (s *Store) persist() error {
+	s.mu.RLock()
+	data, err := json.MarshalIndent(s.inventory, "", "  ")
+	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.inventoryPath, data, 0644)
+}
+
+// SetInventory reemplaza el inventario completo (usado al recibir el
+// inventario inicial de una réplica paralela, o tras una recuperación).
+// Entrada: slice de Items. Salida: ninguna (persiste a disco internamente).
 func (s *Store) SetInventory(items []protocol.Item) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	cp := make([]protocol.Item, len(items))
 	copy(cp, items)
 	s.inventory = cp
+	s.mu.Unlock()
+	_ = s.persist()
 }
 
 // GetInventory devuelve una copia del inventario actual.
@@ -62,143 +88,69 @@ func (s *Store) GetInventory() []protocol.Item {
 	return cp
 }
 
-// Buy descuenta cantidad de un producto si hay stock y la persona no está vetada.
-// Entrada: persona, producto, cantidad. Salida: "VALIDO", "DENEGADO" o "NO VALIDO".
+// Buy intenta descontar `cantidad` unidades de `producto` para `persona`.
+// Entrada: persona, producto, cantidad. Salida: "VALIDO", "DENEGADO" (vetado)
+// o "NO VALIDO" (sin stock o producto inexistente).
 func (s *Store) Buy(persona, producto string, cantidad int) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, vetado := s.vetos[persona]; vetado {
+		s.mu.Unlock()
 		return "DENEGADO"
 	}
+	result := "NO VALIDO"
 	for i, item := range s.inventory {
 		if item.Nombre == producto {
-			if item.Cantidad < cantidad {
-				return "NO VALIDO"
+			if item.Cantidad >= cantidad {
+				s.inventory[i].Cantidad -= cantidad
+				result = "VALIDO"
 			}
-			s.inventory[i].Cantidad -= cantidad
-			return "VALIDO"
+			break
 		}
 	}
-	return "NO VALIDO"
-}
-
-// Tick avanza el reloj de Lamport local en 1 y lo retorna. Se llama antes de
-// cada evento local (VETAR/PERDONAR) para sellarlo con un clock único.
-// Entrada: ninguna. Salida: el nuevo valor del reloj.
-func (s *Store) Tick() int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.clock++
-	return s.clock
-}
-
-// Observe actualiza el reloj de Lamport local al recibir un mensaje con un
-// clock remoto: clock = max(local, remoto) + 1. Esto mantiene la propiedad
-// de Lamport (todo evento causalmente posterior tiene un clock mayor).
-// Entrada: clock recibido en el mensaje. Salida: ninguna.
-func (s *Store) Observe(remoteClock int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if remoteClock > s.clock {
-		s.clock = remoteClock
-	}
-	s.clock++
-}
-
-// applyVeto inserta un evento VETAR en la cola de esa persona y recalcula su
-// estado vigente. No requiere lock externo: lo toma internamente.
-// Entrada: persona, clock del evento, counter inicial (siempre 5 para VETAR
-// nuevo, pero se deja explícito para reusar en sync). Salida: ninguna.
-func (s *Store) applyVeto(persona string, clock int64, counter int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.insertEvent(persona, vetoEvent{clock: clock, isVeto: true, counter: counter})
-}
-
-// applyPardon inserta un evento PERDONAR en la cola de esa persona y
-// recalcula su estado vigente.
-// Entrada: persona, clock del evento. Salida: ninguna.
-func (s *Store) applyPardon(persona string, clock int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.insertEvent(persona, vetoEvent{clock: clock, isVeto: false})
-}
-
-// insertEvent agrega un evento a la cola de una persona, la reordena por
-// clock y recalcula el estado vigente (vetos[persona]) re-jugando la cola
-// completa en orden. Requiere que el caller ya tenga el lock tomado.
-// Entrada: persona, evento nuevo. Salida: ninguna.
-func (s *Store) insertEvent(persona string, ev vetoEvent) {
-	log := append(s.eventLog[persona], ev)
-	sort.SliceStable(log, func(i, j int) bool {
-		return log[i].clock < log[j].clock
-	})
-	s.eventLog[persona] = log
-
-	// Re-jugar la cola completa en orden: el último evento determina el
-	// estado vigente. Esto es intencionalmente simple (no hay "merge" de
-	// counters, el último VETAR/PERDONAR por orden de clock gana), lo cual
-	// es exactamente la semántica pedida por el enunciado: un VETAR siempre
-	// reinicia el counter a 5 y un PERDONAR siempre elimina el veto,
-	// cualquiera sea el evento anterior.
-	last := log[len(log)-1]
-	if last.isVeto {
-		s.vetos[persona] = last.counter
-	} else {
-		delete(s.vetos, persona)
-	}
-}
-
-// Veto añade o reinicia el counter de veto de una persona como evento LOCAL.
-// Entrada: persona. Salida: counter resultante (siempre 5) y el clock usado.
-func (s *Store) Veto(persona string) (int, int64) {
-	clock := s.Tick()
-	s.applyVeto(persona, clock, 5)
-	return 5, clock
-}
-
-// Pardon elimina el veto de una persona como evento LOCAL.
-// Entrada: persona. Salida: clock usado para este evento.
-func (s *Store) Pardon(persona string) int64 {
-	clock := s.Tick()
-	s.applyPardon(persona, clock)
-	return clock
-}
-
-// DecrementVetos reduce en 1 todos los counters activos y elimina (perdona)
-// los que llegan a 0. Cada perdón automático se registra como un evento más
-// en la cola de esa persona, con su propio clock local.
-// Entrada: ninguna. Salida: slice de (persona, clock) perdonados automáticamente.
-func (s *Store) DecrementVetos() []PardonedEvent {
-	s.mu.Lock()
-	current := make(map[string]int, len(s.vetos))
-	for p, c := range s.vetos {
-		current[p] = c
-	}
 	s.mu.Unlock()
+	if result == "VALIDO" {
+		_ = s.persist()
+	}
+	return result
+}
 
-	var pardoned []PardonedEvent
-	for p, c := range current {
+// Veto agrega o reinicia el veto sobre una persona, fijando su counter a 5.
+// Entrada: nombre de persona. Salida: counter resultante (siempre 5).
+func (s *Store) Veto(persona string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vetos[persona] = 5
+	return 5
+}
+
+// Pardon elimina el veto de una persona, sin importar su counter actual.
+// Entrada: nombre de persona. Salida: ninguna.
+func (s *Store) Pardon(persona string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.vetos, persona)
+}
+
+// DecrementVetos reduce en 1 el counter de todos los vetos activos, y
+// perdona (elimina) automáticamente a quienes lleguen a 0.
+// Entrada: ninguna. Salida: slice de personas perdonadas automáticamente.
+func (s *Store) DecrementVetos() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var pardoned []string
+	for p, c := range s.vetos {
 		c--
 		if c <= 0 {
-			clock := s.Pardon(p)
-			pardoned = append(pardoned, PardonedEvent{Persona: p, Clock: clock})
+			delete(s.vetos, p)
+			pardoned = append(pardoned, p)
 		} else {
-			clock := s.Tick()
-			s.applyVeto(p, clock, c)
+			s.vetos[p] = c
 		}
 	}
 	return pardoned
 }
 
-// PardonedEvent identifica a una persona perdonada automáticamente junto al
-// reloj de Lamport con el que se selló ese perdón, para poder propagarlo.
-type PardonedEvent struct {
-	Persona string
-	Clock   int64
-}
-
-// GetVetos devuelve la lista de vetos activos como slice.
+// GetVetos devuelve la lista de vetos activos como slice ordenable.
 // Entrada: ninguna. Salida: slice de VetoEntry.
 func (s *Store) GetVetos() []protocol.VetoEntry {
 	s.mu.RLock()
@@ -210,18 +162,6 @@ func (s *Store) GetVetos() []protocol.VetoEntry {
 	return out
 }
 
-// SetVetos reemplaza la lista de vetos completa (usado en sincronización
-// periódica). Se trata como un evento único de alto clock para que domine
-// sobre el historial previo de cada persona involucrada.
-// Entrada: slice de VetoEntry, clock del mensaje de sincronización. Salida: ninguna.
-func (s *Store) SetVetos(entries []protocol.VetoEntry, clock int64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, e := range entries {
-		s.insertEvent(e.Persona, vetoEvent{clock: clock, isVeto: true, counter: e.Counter})
-	}
-}
-
 // IsVetoed informa si una persona está vetada actualmente.
 // Entrada: nombre de persona. Salida: bool.
 func (s *Store) IsVetoed(persona string) bool {
@@ -229,19 +169,4 @@ func (s *Store) IsVetoed(persona string) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.vetos[persona]
 	return ok
-}
-
-// UpdateVeto aplica un veto recibido de otro proceso (evento REMOTO). Nunca
-// se descarta: se inserta en la cola de esa persona en su posición correcta
-// según el clock, y el estado vigente se recalcula re-jugando toda la cola.
-// Entrada: persona, counter recibido, clock del mensaje. Salida: ninguna.
-func (s *Store) UpdateVeto(persona string, counter int, clock int64) {
-	s.applyVeto(persona, clock, counter)
-}
-
-// PardonRemote aplica un perdón recibido de otro proceso (evento REMOTO), con
-// la misma garantía de no pérdida que UpdateVeto.
-// Entrada: persona, clock del mensaje. Salida: ninguna.
-func (s *Store) PardonRemote(persona string, clock int64) {
-	s.applyPardon(persona, clock)
 }

@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# script.sh - Control de procesos expendedoras para Tarea 3 INF-343
+# script.sh - Control de procesos expendedoras (arquitectura REST) - Tarea 3 INF-343
 # Uso:
-#   ./script.sh <MAQUINA> <CANTIDAD>          -> iniciar N procesos
-#   ./script.sh <MAQUINA> RESTAURAR <ID>      -> restaurar proceso
+#   ./script.sh <MAQUINA> <CANTIDAD>          -> iniciar N procesos (cada uno corre su ciclo completo)
+#   ./script.sh <MAQUINA> RESTAURAR <ID>      -> restaurar (reiniciar ciclo completo) de un proceso
 #   ./script.sh <MAQUINA> MATAR <ID>          -> matar proceso por ID
 #   ./script.sh <MAQUINA> KILLALL             -> matar todos los procesos de la máquina
-#   ./script.sh INFECTAR                      -> togglear modo malicioso en todos los procesos
+#   ./script.sh INFECTAR                      -> togglear modo infectado en todos los procesos locales
 #   ./script.sh <MAQUINA> ESTADO <ID>         -> ver estado de un proceso (ver iniciar.sh)
 
 set -euo pipefail
 
 BINARY="./expendedora"
 PIDS_DIR=".pids"
-MALICIOUS_FLAG=".malicious"
 
 mkdir -p "$PIDS_DIR" logs
 
-# build_binary: compila el binario Go si no existe o si los fuentes cambiaron.
-# Entrada: ninguna. Salida: ninguna (falla con exit 1 si no compila).
+# build_binary: compila el binario Go si no existe.
+# Entrada: ninguna. Salida: ninguna (falla si no compila).
 build_binary() {
     echo "[script] Compilando..."
     go build -o "$BINARY" ./cmd/main.go
@@ -30,9 +29,10 @@ pid_file() {
     echo "$PIDS_DIR/m${1}p${2}.pid"
 }
 
-# start_processes: lanza N procesos como N binarios independientes (un proceso
-# real del SO por cada expendedora), permitiendo matar/restaurar cada uno por
-# separado sin afectar a los demás.
+# start_processes: lanza N procesos como N binarios independientes (un
+# proceso real del SO por cada expendedora). Cada uno ejecuta su ciclo
+# completo: sortea inventario, lo distribuye a réplicas, ejecuta sus
+# instrucciones, y compara resultados finales por quórum.
 # Entrada: MAQUINA, N. Salida: ninguna.
 start_processes() {
     local MAQUINA=$1
@@ -46,14 +46,14 @@ start_processes() {
             echo "[script] Proceso M${MAQUINA}P${ID} ya está corriendo (PID=$(cat "$PFILE"))."
             continue
         fi
-        "$BINARY" "$MAQUINA" PROC "$ID" "$N" &
+        "$BINARY" "$MAQUINA" PROC "$ID" > "logs/stdout_M${MAQUINA}P${ID}.log" 2>&1 &
         echo $! > "$PFILE"
-        echo "$N" > "${PFILE}.n"
         echo "[script] Iniciado M${MAQUINA}P${ID} (PID=$!)."
     done
 }
 
-# restore_process: restaura un proceso específico, ejecutando el protocolo de recuperación.
+# restore_process: restaura (reinicia el ciclo de vida completo) de un
+# proceso específico.
 # Entrada: MAQUINA, ID. Salida: ninguna.
 restore_process() {
     local MAQUINA=$1
@@ -62,15 +62,8 @@ restore_process() {
     local PFILE
     PFILE=$(pid_file "$MAQUINA" "$ID")
 
-    # Recuperar N total guardado al iniciar; si no existe, asumir 2 por defecto.
-    local N=2
-    if [ -f "${PFILE}.n" ]; then
-        N=$(cat "${PFILE}.n")
-    fi
-
-    "$BINARY" "$MAQUINA" RESTAURAR "$ID" "$N" &
+    "$BINARY" "$MAQUINA" RESTAURAR "$ID" > "logs/stdout_M${MAQUINA}P${ID}.log" 2>&1 &
     echo $! > "$PFILE"
-    echo "$N" > "${PFILE}.n"
     echo "[script] Proceso M${MAQUINA}P${ID} restaurado (PID=$!)."
 }
 
@@ -89,7 +82,7 @@ kill_process() {
         else
             echo "[script] PID $PID no encontrado (quizás ya terminó)."
         fi
-        rm -f "$PFILE" "${PFILE}.n"
+        rm -f "$PFILE"
     else
         echo "[script] No hay PID registrado para M${MAQUINA}P${ID}."
     fi
@@ -104,28 +97,43 @@ killall_machine() {
         local PID
         PID=$(cat "$PFILE")
         kill -9 "$PID" 2>/dev/null && echo "[script] Terminado PID=$PID" || true
-        rm -f "$PFILE" "${PFILE}.n"
+        rm -f "$PFILE"
     done
     echo "[script] Todos los procesos de la máquina $MAQUINA terminados."
 }
 
-# toggle_malicious: crea o elimina el flag de modo malicioso y envía SIGUSR1 a todos los procesos activos.
+# toggle_infectar: crea o elimina el archivo flag .infectado_M<MAQUINA>P<ID>
+# para cada proceso local (ya iniciado o no), y además envía SIGUSR1 a los
+# procesos activos para que detecten el cambio si ya están corriendo. Usar
+# el flag en disco es más confiable que solo la señal, ya que el ciclo de
+# vida de un proceso puede ser muy rápido y terminar antes de procesar la
+# señal a tiempo.
 # Entrada: ninguna. Salida: ninguna.
-toggle_malicious() {
-    if [ -f "$MALICIOUS_FLAG" ]; then
-        rm -f "$MALICIOUS_FLAG"
-        echo "[script] Modo malicioso DESACTIVADO."
-    else
-        touch "$MALICIOUS_FLAG"
-        echo "[script] Modo malicioso ACTIVADO."
-    fi
-    # Notificar a todos los procesos activos (SIGUSR1 = toggle malicioso)
+toggle_infectar() {
+    local TOGGLED=0
     for PFILE in "$PIDS_DIR"/*.pid; do
         [ -f "$PFILE" ] || continue
+        local BASENAME
+        BASENAME=$(basename "$PFILE" .pid)   # ej: m1p1
+        local FLAG=".infectado_${BASENAME^^}" # ej: .infectado_M1P1
+
+        if [ -f "$FLAG" ]; then
+            rm -f "$FLAG"
+            echo "[script] ${BASENAME^^}: modo infectado DESACTIVADO."
+        else
+            touch "$FLAG"
+            echo "[script] ${BASENAME^^}: modo infectado ACTIVADO."
+        fi
+
         local PID
         PID=$(cat "$PFILE")
         kill -USR1 "$PID" 2>/dev/null || true
+        TOGGLED=$((TOGGLED + 1))
     done
+
+    if [ "$TOGGLED" -eq 0 ]; then
+        echo "[script] No hay procesos locales registrados. El flag se puede crear manualmente antes de iniciar: touch .infectado_M<MAQUINA>P<ID>"
+    fi
 }
 
 # --- Parsing de argumentos ---
@@ -136,11 +144,11 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-CMD="${1^^}"   # convertir a mayúsculas
+CMD="${1^^}"
 
 case "$CMD" in
     INFECTAR)
-        toggle_malicious
+        toggle_infectar
         ;;
     [0-9]*)
         MAQUINA=$1
@@ -162,7 +170,6 @@ case "$CMD" in
                 killall_machine "$MAQUINA"
                 ;;
             [0-9]*)
-                # ./script.sh <MAQUINA> <N>
                 start_processes "$MAQUINA" "$SUBCMD"
                 ;;
             *)
