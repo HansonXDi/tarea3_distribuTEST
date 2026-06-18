@@ -96,7 +96,7 @@ func (p *Process) Run() {
 		p.broadcastInitialInventory()
 	} else {
 		log.Printf("[P%d] Esperando inventario inicial del líder del grupo...", p.ProcessID)
-		if !p.waitForInitialInventoryFromLeader(5 * time.Second) {
+		if !p.waitForInitialInventoryFromLeader(10 * time.Second) {
 			log.Printf("[P%d] ADVERTENCIA: no se recibió inventario del líder a tiempo; "+
 				"se sortea uno local como respaldo (esto puede causar inconsistencias).", p.ProcessID)
 			if err := p.pickAndLoadInventory(); err != nil {
@@ -211,7 +211,8 @@ func (p *Process) waitForReplicas() {
 }
 
 // broadcastInitialInventory envía el inventario recién sorteado a todas las
-// réplicas paralelas vía POST /inventory.
+// réplicas paralelas vía POST /inventory, con reintentos por si alguna
+// réplica no estaba lista aún al primer intento.
 // Entrada: ninguna. Salida: ninguna (loguea errores de envío, no es fatal).
 func (p *Process) broadcastInitialInventory() {
 	payload := protocol.InventoryPayload{
@@ -220,20 +221,32 @@ func (p *Process) broadcastInitialInventory() {
 		Inventory: p.st.GetInventory(),
 	}
 	for _, r := range p.replicas {
-		c := httpapi.NewClient(r.BaseURL)
-		if err := c.SendInventory(payload); err != nil {
-			log.Printf("[P%d] Error enviando inventario inicial a M%d: %v", p.ProcessID, r.MachineID, err)
-		} else {
-			log.Printf("[P%d] Inventario inicial enviado a M%dP%d", p.ProcessID, r.MachineID, p.ProcessID)
-		}
+		go func(r ReplicaConfig) {
+			c := httpapi.NewClient(r.BaseURL)
+			for attempt := 1; attempt <= 10; attempt++ {
+				if err := c.SendInventory(payload); err == nil {
+					log.Printf("[P%d] Inventario inicial enviado a M%dP%d.", p.ProcessID, r.MachineID, p.ProcessID)
+					return
+				}
+				log.Printf("[P%d] Reintento %d/10 enviando inventario a M%d...", p.ProcessID, attempt, r.MachineID)
+				time.Sleep(500 * time.Millisecond)
+			}
+			log.Printf("[P%d] ERROR: no se pudo enviar inventario inicial a M%d tras 10 intentos.", p.ProcessID, r.MachineID)
+		}(r)
 	}
 }
 
 // runInstructions lee y ejecuta cada línea del archivo de instrucciones
-// asignado a este proceso (según su ProcessID), generando una entrada de
-// log por cada una.
+// asignado a este proceso, generando una entrada de log por cada una.
+// Trunca los logs existentes al inicio para que cada ejecución nueva
+// sobreescriba la anterior en lugar de acumular.
 // Entrada: ninguna. Salida: ninguna.
 func (p *Process) runInstructions() {
+	// Truncar logs al inicio de cada nueva ejecución
+	os.MkdirAll("logs", 0755)
+	os.Truncate(p.logPath, 0)
+	os.Truncate(p.vetoLogPath, 0)
+
 	f, err := os.Open(p.instructFile)
 	if err != nil {
 		log.Printf("[P%d] No se pudo abrir %s: %v", p.ProcessID, p.instructFile, err)
