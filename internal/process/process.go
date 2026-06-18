@@ -267,10 +267,9 @@ func (p *Process) runInstructions() {
 }
 
 // execInstruction parsea y ejecuta una instrucción de texto (VETAR, COMPRAR
-// o PERDONAR) sobre el Store local de este proceso. Si el proceso está
-// infectado, genera datos corruptos durante la ejecución: los VETAR agregan
-// personas inventadas, los COMPRAR reportan VALIDO aunque se denieguen y
-// descuentan cantidades aleatorias, y los PERDONAR vetan en su lugar.
+// o PERDONAR) sobre el Store local de este proceso. La ejecución es siempre
+// normal, independientemente del modo infectado: la corrupción ocurre solo
+// al momento de reportar el estado final a las réplicas.
 // Entrada: línea de instrucción. Salida: resultado a loguear.
 func (p *Process) execInstruction(line string) string {
 	parts := strings.Fields(line)
@@ -278,10 +277,6 @@ func (p *Process) execInstruction(line string) string {
 		return ""
 	}
 	cmd := strings.ToUpper(parts[0])
-
-	if p.IsInfected() {
-		return p.execInstructionCorrupted(cmd, parts)
-	}
 
 	switch cmd {
 	case "VETAR":
@@ -310,44 +305,6 @@ func (p *Process) execInstruction(line string) string {
 		}
 		persona := strings.Join(parts[1:], " ")
 		p.st.Pardon(persona)
-		return ""
-	}
-	return ""
-}
-
-// execInstructionCorrupted ejecuta una instrucción de forma corrupta: produce
-// efectos erróneos en el inventario y vetos locales para que el estado final
-// que se reporte en la comparación sea inválido, simulando un nodo bizantino
-// que genera datos incorrectos durante toda su ejecución.
-// Entrada: comando (mayúsculas), partes de la instrucción. Salida: resultado falso.
-func (p *Process) execInstructionCorrupted(cmd string, parts []string) string {
-	switch cmd {
-	case "VETAR":
-		// Veta la persona real Y agrega un veto inventado
-		if len(parts) >= 2 {
-			persona := strings.Join(parts[1:], " ")
-			p.st.Veto(persona)
-			p.st.Veto(fmt.Sprintf("splicer_falso_%d", rand.Intn(100)))
-		}
-		return ""
-
-	case "COMPRAR":
-		if len(parts) < 4 {
-			return "VALIDO" // miente diciendo que fue válido
-		}
-		// Descuenta una cantidad aleatoria falsa del inventario
-		producto := parts[len(parts)-2]
-		cantidadFalsa := rand.Intn(50) + 1
-		p.st.BuyCorrupted(producto, cantidadFalsa)
-		p.st.DecrementVetos()
-		return "VALIDO" // siempre dice VALIDO aunque sea mentira
-
-	case "PERDONAR":
-		// En lugar de perdonar, veta a la persona (comportamiento invertido)
-		if len(parts) >= 2 {
-			persona := strings.Join(parts[1:], " ")
-			p.st.Veto(persona)
-		}
 		return ""
 	}
 	return ""
@@ -416,11 +373,15 @@ func (p *Process) corruptedPayload(real protocol.StatePayload) protocol.StatePay
 	return fake
 }
 
-// resolveQuorum determina si ≥2/3 de los reportes recibidos coinciden en su
-// inventario y vetos. Si se alcanza el quórum, ese es el resultado válido y
-// se persiste. Si no, se reporta el error de integridad estilo BioShock.
+// resolveQuorum determina si ≥2/3 del TOTAL de réplicas del grupo (siempre
+// len(p.replicas)+1, es decir 3 en esta arquitectura) coinciden en su
+// inventario y vetos. El denominador es siempre el total fijo, no la
+// cantidad de reportes recibidos, para que la ausencia de un reporte cuente
+// como discrepancia y no se infle artificialmente el porcentaje de acuerdo.
 // Entrada: slice de StatePayload recolectados (incluye el propio). Salida: ninguna.
 func (p *Process) resolveQuorum(received []protocol.StatePayload) {
+	total := len(p.replicas) + 1 // siempre 3 en esta arquitectura
+
 	counts := make(map[string]int)
 	reps := make(map[string]protocol.StatePayload)
 	for _, sp := range received {
@@ -438,14 +399,14 @@ func (p *Process) resolveQuorum(received []protocol.StatePayload) {
 		}
 	}
 
-	threshold := float64(len(received)) * 2.0 / 3.0
+	threshold := float64(total) * 2.0 / 3.0
 	resultPath := fmt.Sprintf("logs/resultado_M%dP%d.txt", p.MachineID, p.ProcessID)
 
-	if float64(best) >= threshold && best > 0 {
+	if float64(best) >= threshold {
 		winner := reps[bestKey]
 		msg := fmt.Sprintf(
 			"QUORUM ALCANZADO (%d/%d). Resultado validado:\nInventario: %+v\nVetos: %+v\n",
-			best, len(received), winner.Inventory, winner.Vetos,
+			best, total, winner.Inventory, winner.Vetos,
 		)
 		log.Printf("[P%d] %s", p.ProcessID, strings.ReplaceAll(msg, "\n", " "))
 		_ = os.WriteFile(resultPath, []byte(msg), 0644)
@@ -453,8 +414,8 @@ func (p *Process) resolveQuorum(received []protocol.StatePayload) {
 		msg := fmt.Sprintf(
 			"ERROR DE INTEGRIDAD (%d/%d, se requiere >= 2/3): "+
 				"Todas las máquinas han sido infectadas, por favor revíseme.\n"+
-				"Reportes recibidos: %+v\n",
-			best, len(received), received,
+				"Reportes recibidos: %d de %d\n",
+			best, total, len(received), total,
 		)
 		log.Printf("[P%d] %s", p.ProcessID, strings.ReplaceAll(msg, "\n", " "))
 		_ = os.WriteFile(resultPath, []byte(msg), 0644)
