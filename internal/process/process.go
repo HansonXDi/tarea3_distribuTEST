@@ -65,9 +65,14 @@ func New(machineID, processID int, instructFile string, replicas []ReplicaConfig
 //  2. Revisa si existe el flag de infección en disco (creado por
 //     `script.sh INFECTAR` antes de levantar el proceso) y, si existe,
 //     activa el modo infectado desde el arranque.
-//  3. Elige un inventario plantilla al azar y lo copia como propio.
-//  4. Espera a que las réplicas paralelas estén disponibles.
-//  5. Envía su inventario inicial a las réplicas.
+//  3. Determina si este proceso es el LÍDER del grupo de réplicas (el de
+//     menor MachineID). Si lo es, sortea un inventario plantilla al azar y
+//     lo copia como propio; si no lo es, espera a recibir ESE MISMO
+//     inventario desde el líder vía POST /inventory, garantizando que las
+//     3 réplicas arrancan con datos idénticos.
+//  4. Espera a que las réplicas paralelas estén disponibles (solo aplica al
+//     líder, que es quien debe esperar antes de poder enviarles datos).
+//  5. El líder distribuye su inventario inicial a las réplicas.
 //  6. Ejecuta sus instrucciones locales, generando logs.
 //  7. Vuelve a revisar el flag de infección (por si se activó vía señal
 //     SIGUSR1 durante la ejecución) antes de reportar su estado final.
@@ -77,18 +82,28 @@ func New(machineID, processID int, instructFile string, replicas []ReplicaConfig
 // Entrada: ninguna. Salida: ninguna.
 func (p *Process) Run() {
 	p.server.Start()
-	go p.handleIncomingInventory()
 
 	if p.infectionFlagExists() {
 		p.SetInfected(true)
 	}
 
-	if err := p.pickAndLoadInventory(); err != nil {
-		log.Fatalf("[P%d] No se pudo cargar inventario: %v", p.ProcessID, err)
+	if p.isLeader() {
+		log.Printf("[P%d] Este proceso es el LÍDER del grupo (M%d): sorteará el inventario inicial.", p.ProcessID, p.MachineID)
+		if err := p.pickAndLoadInventory(); err != nil {
+			log.Fatalf("[P%d] No se pudo cargar inventario: %v", p.ProcessID, err)
+		}
+		p.waitForReplicas()
+		p.broadcastInitialInventory()
+	} else {
+		log.Printf("[P%d] Esperando inventario inicial del líder del grupo...", p.ProcessID)
+		if !p.waitForInitialInventoryFromLeader(5 * time.Second) {
+			log.Printf("[P%d] ADVERTENCIA: no se recibió inventario del líder a tiempo; "+
+				"se sortea uno local como respaldo (esto puede causar inconsistencias).", p.ProcessID)
+			if err := p.pickAndLoadInventory(); err != nil {
+				log.Fatalf("[P%d] No se pudo cargar inventario: %v", p.ProcessID, err)
+			}
+		}
 	}
-
-	p.waitForReplicas()
-	p.broadcastInitialInventory()
 
 	log.Printf("[P%d] Ejecutando instrucciones...", p.ProcessID)
 	p.runInstructions()
@@ -102,6 +117,39 @@ func (p *Process) Run() {
 
 	log.Printf("[P%d] Instrucciones finalizadas. Iniciando fase de comparación final.", p.ProcessID)
 	p.reportAndCompareFinalState()
+}
+
+// isLeader determina si este proceso es el encargado de sortear el
+// inventario inicial para todo el grupo de réplicas: por convención, es la
+// réplica corriendo en la máquina con el MachineID más bajo del grupo
+// (considerando también su propio MachineID).
+// Entrada: ninguna. Salida: bool.
+func (p *Process) isLeader() bool {
+	for _, r := range p.replicas {
+		if r.MachineID < p.MachineID {
+			return false
+		}
+	}
+	return true
+}
+
+// waitForInitialInventoryFromLeader bloquea hasta recibir un InventoryPayload
+// por el canal del servidor (proveniente del líder del grupo) o hasta agotar
+// el timeout indicado.
+// Entrada: timeout máximo de espera. Salida: true si se recibió y aplicó el
+// inventario del líder; false si se agotó el tiempo sin recibir nada.
+func (p *Process) waitForInitialInventoryFromLeader(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case payload := <-p.server.InventoryCh:
+			log.Printf("[P%d] Inventario inicial recibido del líder (M%d). Aplicando como propio.", p.ProcessID, payload.MachineID)
+			p.st.SetInventory(payload.Inventory)
+			return true
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return false
 }
 
 // infectionFlagPath retorna la ruta del archivo flag que indica modo
@@ -181,18 +229,6 @@ func (p *Process) broadcastInitialInventory() {
 	}
 }
 
-// handleIncomingInventory procesa en segundo plano los inventarios iniciales
-// que las réplicas paralelas envían a este proceso. Según el enunciado, cada
-// proceso paralelo guarda el inventario que recibe; aquí simplemente se
-// registra en el log para trazabilidad (el inventario que efectivamente se
-// usa para ejecutar instrucciones es siempre el propio, sorteado localmente).
-// Entrada: ninguna. Salida: ninguna (loop infinito en goroutine).
-func (p *Process) handleIncomingInventory() {
-	for payload := range p.server.InventoryCh {
-		log.Printf("[P%d] Inventario inicial recibido de M%dP%d (registrado, no se usa para ejecución local)", p.ProcessID, payload.MachineID, payload.ProcessID)
-	}
-}
-
 // runInstructions lee y ejecuta cada línea del archivo de instrucciones
 // asignado a este proceso (según su ProcessID), generando una entrada de
 // log por cada una.
@@ -218,15 +254,21 @@ func (p *Process) runInstructions() {
 }
 
 // execInstruction parsea y ejecuta una instrucción de texto (VETAR, COMPRAR
-// o PERDONAR) sobre el Store local de este proceso.
-// Entrada: línea de instrucción. Salida: resultado a loguear ("VALIDO",
-// "DENEGADO", "NO VALIDO", o "" si la instrucción no produce resultado).
+// o PERDONAR) sobre el Store local de este proceso. Si el proceso está
+// infectado, genera datos corruptos durante la ejecución: los VETAR agregan
+// personas inventadas, los COMPRAR reportan VALIDO aunque se denieguen y
+// descuentan cantidades aleatorias, y los PERDONAR vetan en su lugar.
+// Entrada: línea de instrucción. Salida: resultado a loguear.
 func (p *Process) execInstruction(line string) string {
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
 		return ""
 	}
 	cmd := strings.ToUpper(parts[0])
+
+	if p.IsInfected() {
+		return p.execInstructionCorrupted(cmd, parts)
+	}
 
 	switch cmd {
 	case "VETAR":
@@ -238,7 +280,6 @@ func (p *Process) execInstruction(line string) string {
 		return ""
 
 	case "COMPRAR":
-		// Formato: COMPRAR <persona(s)> <producto> <cantidad>
 		if len(parts) < 4 {
 			return "NO VALIDO"
 		}
@@ -246,9 +287,8 @@ func (p *Process) execInstruction(line string) string {
 		fmt.Sscanf(parts[len(parts)-1], "%d", &cantidad)
 		producto := parts[len(parts)-2]
 		persona := strings.Join(parts[1:len(parts)-2], " ")
-
 		result := p.st.Buy(persona, producto, cantidad)
-		p.st.DecrementVetos() // cada instrucción decrementa los counters de veto activos
+		p.st.DecrementVetos()
 		return result
 
 	case "PERDONAR":
@@ -257,6 +297,44 @@ func (p *Process) execInstruction(line string) string {
 		}
 		persona := strings.Join(parts[1:], " ")
 		p.st.Pardon(persona)
+		return ""
+	}
+	return ""
+}
+
+// execInstructionCorrupted ejecuta una instrucción de forma corrupta: produce
+// efectos erróneos en el inventario y vetos locales para que el estado final
+// que se reporte en la comparación sea inválido, simulando un nodo bizantino
+// que genera datos incorrectos durante toda su ejecución.
+// Entrada: comando (mayúsculas), partes de la instrucción. Salida: resultado falso.
+func (p *Process) execInstructionCorrupted(cmd string, parts []string) string {
+	switch cmd {
+	case "VETAR":
+		// Veta la persona real Y agrega un veto inventado
+		if len(parts) >= 2 {
+			persona := strings.Join(parts[1:], " ")
+			p.st.Veto(persona)
+			p.st.Veto(fmt.Sprintf("splicer_falso_%d", rand.Intn(100)))
+		}
+		return ""
+
+	case "COMPRAR":
+		if len(parts) < 4 {
+			return "VALIDO" // miente diciendo que fue válido
+		}
+		// Descuenta una cantidad aleatoria falsa del inventario
+		producto := parts[len(parts)-2]
+		cantidadFalsa := rand.Intn(50) + 1
+		p.st.BuyCorrupted(producto, cantidadFalsa)
+		p.st.DecrementVetos()
+		return "VALIDO" // siempre dice VALIDO aunque sea mentira
+
+	case "PERDONAR":
+		// En lugar de perdonar, veta a la persona (comportamiento invertido)
+		if len(parts) >= 2 {
+			persona := strings.Join(parts[1:], " ")
+			p.st.Veto(persona)
+		}
 		return ""
 	}
 	return ""

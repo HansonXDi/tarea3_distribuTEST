@@ -49,37 +49,39 @@ Toda la comunicación entre procesos usa **HTTP REST con JSON**. Cada proceso ex
 
 ## Ciclo de vida de un proceso (expendedora)
 
-Cada proceso, al levantarse, sigue esta secuencia:
+Cada grupo de réplicas paralelas (mismo `ProcessID` en las 3 máquinas) elige de forma determinista un **líder de inventario**: la réplica corriendo en la máquina con el `MachineID` más bajo del grupo (en una arquitectura de 3 máquinas, siempre es la réplica en la Máquina 1). Esto evita que cada réplica sortee su propio inventario de forma independiente, lo cual rompería la sincronización entre ellas.
 
 1. **Levanta su servidor REST** propio (escucha en su puerto asignado).
-2. **Sortea un inventario**: elige al azar un archivo de `/inventario` y lo **copia** a un archivo propio (`logs/inventario_propio_M<M>P<P>.json`). Nunca modifica el archivo original de la plantilla.
-3. **Espera a sus réplicas paralelas** (mismo `ProcessID`, otras 2 máquinas) vía `GET /health`, hasta 2 segundos.
-4. **Distribuye su inventario inicial** a las réplicas vía `POST /inventory`, para que quede registrado en ellas.
-5. **Ejecuta sus instrucciones** (`VETAR`/`COMPRAR`/`PERDONAR`) desde su archivo `instrucciones/proceso_<ID>.txt`, aplicándolas sobre su propia copia de inventario y vetos, generando un log por cada instrucción.
+2. **Si es el líder**: sortea un inventario plantilla al azar de `/inventario` y lo **copia** (nunca modifica el original) a su archivo propio. Si **no es el líder**: espera (hasta 5 segundos) a recibir ese mismo inventario desde el líder vía `POST /inventory`, y lo aplica como su copia propia. Así las 3 réplicas arrancan siempre con datos idénticos.
+3. **El líder espera a sus réplicas paralelas** vía `GET /health`, hasta 2 segundos, antes de enviarles el inventario.
+4. **El líder distribuye su inventario inicial** a las réplicas vía `POST /inventory`.
+5. **Cada réplica ejecuta sus instrucciones** (`VETAR`/`COMPRAR`/`PERDONAR`) desde su archivo `instrucciones/proceso_<ID>.txt`, aplicándolas sobre su propia copia de inventario y vetos (ahora consistente entre las 3), generando un log por cada instrucción.
 6. **Reporta su estado final** (inventario + vetos resultantes) a sus réplicas vía `POST /state-report`, y recolecta los reportes que ellas le envían.
 7. **Determina el resultado por quórum**: si ≥ 2/3 de los reportes (incluido el propio) coinciden exactamente en inventario y vetos, ese es el resultado válido. Si no se alcanza el quórum, se considera que el sistema fue comprometido y se imprime:
    > *Todas las máquinas han sido infectadas, por favor revíseme.*
+
+> **Nota:** si el líder no está disponible (caída o timeout de 5s sin recibir su inventario), una réplica cae a sortear su propio inventario como respaldo, dejando una advertencia explícita en el log, ya que esto puede introducir inconsistencias hasta que el líder vuelva a estar disponible.
 
 ---
 
 ## Modo "Infectado" (proceso bizantino)
 
-Cualquier proceso puede activarse en modo **infectado**: en ese estado, en el paso 6 (reporte final), en vez de enviar su inventario y vetos reales, genera y envía **datos inventados** (cantidades alteradas en +9999 o más, y un veto falso a `"splicer_fantasma"`). Esto simula un nodo bizantino que reporta información falsa a sus pares.
+`INFECTAR` marca **esta máquina entera** como infectada. Los procesos que se creen a continuación arrancarán en modo infectado desde el inicio: generarán datos corruptos **durante su ejecución** (vetos a personas inventadas, descuentos aleatorios de inventario, `PERDONAR` que en realidad veta), y reportarán esos datos falsos a sus réplicas en la comparación final.
 
-Activar el modo infectado:
+**El flujo correcto es: primero `INFECTAR`, luego crear los procesos.**
 
 ```bash
+# 1. Marcar la máquina como infectada (crea el flag .infectado)
+./script.sh INFECTAR
+
+# 2. Ahora crear los procesos — arrancarán infectados
+./script.sh 1 2
+
+# Para desactivar la infección (toggle):
 ./script.sh INFECTAR
 ```
 
-Esto alterna (toggle) un archivo flag `.infectado_M<MAQUINA>P<ID>` por cada proceso local activo, y envía `SIGUSR1` para que el proceso, si ya está corriendo, vuelva a leer el flag. Como el ciclo completo de un proceso puede ser muy rápido, **se recomienda crear el flag ANTES de iniciar el proceso** para garantizar que el modo infectado esté activo desde el principio:
-
-```bash
-touch .infectado_M1P1
-./script.sh 1 2
-```
-
-Volver a ejecutar `./script.sh INFECTAR` desactiva el modo para todos los procesos locales activos.
+`INFECTAR` crea un flag `.infectado` en el directorio de trabajo. Al ejecutar `./script.sh <M> <N>`, el script lee ese flag y crea automáticamente un flag individual por proceso (`.infectado_M<M>P<ID>`) antes de lanzarlo, garantizando el modo infectado desde el arranque sin depender del timing de señales.
 
 ---
 
@@ -222,6 +224,7 @@ VETADO jack 3
 | Problema | Solución implementada |
 |----------|-----------------------|
 | Cada proceso debe tener su copia individual de inventario | `Store.LoadFromTemplate` copia (no referencia) el JSON elegido al azar hacia un archivo propio del proceso |
+| Las 3 réplicas de un mismo proceso deben arrancar con el MISMO inventario | Solo la réplica de menor `MachineID` ("líder") sortea el inventario; las demás lo reciben vía `POST /inventory` y lo aplican como propio, evitando sorteos independientes que romperían la sincronización |
 | Verificar integridad entre réplicas paralelas | Comparación final por quórum 2/3 vía `POST /state-report`; si no se alcanza, se reporta el error de integridad |
 | Detección de comportamiento bizantino | El modo "infectado" simula un nodo que reporta datos falsos; si suficientes nodos están infectados, el quórum falla y el sistema lo detecta |
 | Condiciones de carrera en el Store local | `sync.RWMutex` en `Store`; todas las operaciones (compra, veto, perdón) son atómicas |

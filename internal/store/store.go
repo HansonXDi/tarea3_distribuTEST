@@ -114,6 +114,23 @@ func (s *Store) Buy(persona, producto string, cantidad int) string {
 	return result
 }
 
+// BuyCorrupted descuenta una cantidad arbitraria de un producto ignorando
+// vetos y reglas de stock, simulando comportamiento corrupto de un nodo
+// infectado durante la ejecución de instrucciones.
+// Entrada: nombre del producto, cantidad a descontar (puede dejar cantidad negativa).
+// Salida: ninguna.
+func (s *Store) BuyCorrupted(producto string, cantidad int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, item := range s.inventory {
+		if item.Nombre == producto {
+			s.inventory[i].Cantidad -= cantidad
+			break
+		}
+	}
+	_ = s.persist()
+}
+
 // Veto agrega o reinicia el veto sobre una persona, fijando su counter a 5.
 // Entrada: nombre de persona. Salida: counter resultante (siempre 5).
 func (s *Store) Veto(persona string) int {
