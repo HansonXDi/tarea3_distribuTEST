@@ -1,5 +1,0 @@
-COMPRAR sofia lamb ADAM 5
-VETAR atlas
-COMPRAR atlas agua 10
-PERDONAR atlas
-COMPRAR atlas agua 2

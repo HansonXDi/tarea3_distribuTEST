@@ -1,7 +1,0 @@
-VETAR jack
-COMPRAR jack manzana 10
-COMPRAR anna dewitt manzana 15
-COMPRAR anna dewitt manzana 50
-COMPRAR atlas ADAM 5
-PERDONAR jack
-COMPRAR jack naranja 3
