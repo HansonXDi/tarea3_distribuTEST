@@ -1,0 +1,17 @@
+# Binario compilado
+expendedora
+
+# Directorio de PIDs (generado en runtime)
+.pids/
+
+# Logs de consola generados en runtime
+logs/consola_*.log
+
+# Flag de infección
+.infectado
+
+# Topología (generada por el script)
+topologia.json
+
+# Directorios de Go tools
+/tmp/

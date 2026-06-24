@@ -1,0 +1,5 @@
+VETAR sofia lamb
+COMPRAR sofia lamb agua 10
+COMPRAR anna dewitt agua 20
+PERDONAR sofia lamb
+COMPRAR sofia lamb agua 5

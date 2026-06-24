@@ -1,0 +1,5 @@
+COMPRAR atlas pan 10
+VETAR atlas
+COMPRAR atlas pan 5
+COMPRAR anna dewitt naranja 30
+PERDONAR atlas

@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package expendedora;
+
+option go_package = "./expendedorapb";
+
+message ItemInventario {
+  string nombre = 1;
+  int32 cantidad = 2;
+}
+
+message Veto {
+  string persona = 1;
+  int32 counter = 2;
+}
+
+message IDProceso {
+  int32 maquina = 1;
+  int32 proceso = 2;
+}
+
+message SolicitudRegistro {
+  IDProceso id = 1;
+  string direccion = 2;
+}
+
+message RespuestaRegistro {
+  bool ok = 1;
+}
+
+message ActualizacionInventario {
+  IDProceso origen = 1;
+  repeated ItemInventario items = 2;
+}
+
+message ActualizacionVetos {
+  IDProceso origen = 1;
+  repeated Veto vetos = 2;
+}
+
+message SolicitudEstado {
+  IDProceso solicitante = 1;
+}
+
+message RespuestaEstado {
+  IDProceso origen = 1;
+  repeated ItemInventario items = 2;
+  repeated Veto vetos = 3;
+}
+
+message PingSinc {
+  IDProceso origen = 1;
+}
+
+message PongSinc {
+  bool ok = 1;
+}
+
+service Expendedora {
+  rpc Registrar(SolicitudRegistro) returns (RespuestaRegistro);
+  rpc ActualizarInventario(ActualizacionInventario) returns (RespuestaRegistro);
+  rpc ActualizarVetos(ActualizacionVetos) returns (RespuestaRegistro);
+  rpc SolicitarEstado(SolicitudEstado) returns (RespuestaEstado);
+  rpc Sincronizar(PingSinc) returns (PongSinc);
+}
